@@ -8,11 +8,13 @@
 
 ## 功能概述
 
-- 🌐 **多源抓取**：Hacker News API + TechCrunch RSS + 36Kr RSS
-- 🏷️ **自动分类**：基于关键词把新闻归入 `finance` / `ai` / `tech` 三大板块
-- 🧠 **LLM 摘要**：调用本地 Hermes Agent（OpenAI 兼容 `/v1/chat/completions`）生成 5–8 条中文速递
-- 📱 **微信投递**：通过 Hermes 内置的 iLink Bot adapter (`send_weixin_direct`) 直接推送
-- ⏰ **定时调度**：由 Hermes 内置 cron scheduler 触发，无需系统 crontab
+- 🌐 **多源并行抓取**：29 个信息源（HN API + RSS + GitHub Trending HTML），单源失败不阻塞
+- 🏷️ **自动分类**：关键词归入 `finance` / `ai` / `tech` / `world` 四大板块
+- ⚖️ **权重排序**：源权重 × 新鲜度 × 热度 + **交叉源奖励** + 关键词加分 × 板块系数
+- 🔀 **交叉验证去重**：标题相似度聚类（英文 token + 中文 bigram Jaccard），多源命中的事件自动加权
+- 🧠 **LLM 摘要**：Hermes Agent 根据评分挑选 5–9 条精选，附原始来源列表
+- 📱 **微信投递**：Hermes iLink Bot adapter (`send_weixin_direct`)
+- ⏰ **定时调度**：Hermes 内置 cron scheduler（无需系统 crontab）
 
 ---
 
@@ -51,31 +53,60 @@
 
 ━━━ 💰 金融市场 ━━━
 
-1️⃣ 【美联储维持利率不变】
-美联储宣布维持 5.25%–5.50% 利率区间，市场普遍预期年内仍有两次降息……
+1️⃣ 【美联储放鸽，年内预期两降】
+美联储维持 5.25–5.50% 利率，鲍威尔暗示年内仍有两次降息空间……
+📎 WSJ Markets · CNBC · 华尔街见闻 · MarketWatch
 
 ━━━ 🤖 AI 前沿 ━━━
 
-2️⃣ 【OpenAI 发布 GPT-6 预览】
-新模型在数学推理基准上提升 23%，同时推理成本下降 40%……
+2️⃣ 【OpenAI 发布 Codex 全平台更新】
+新版 Codex 桌面端加入 computer-use、图像生成、插件能力……
+📎 OpenAI Blog · Hacker News
 
 ━━━ 🔬 科技动态 ━━━
 
-3️⃣ 【苹果 Vision Pro 2 曝光】
-重量减轻 30%，售价下探至 $2499……
+3️⃣ 【Bluesky 遭遇持续 DDoS】
+Bluesky 社交平台被攻击近 24 小时……
+📎 Hacker News · The Verge
 
-📎 新闻来源: Hacker News, TechCrunch, 36Kr
+━━━ 🌍 世界要闻 ━━━
+
+4️⃣ 【…】
+📎 BBC World · NYT HomePage
+
+📊 本期覆盖多源交叉验证 | 共 8 条精选
 ```
 
 ---
 
-## 新闻来源
+## 新闻来源（29 个，并行抓取）
 
-| 来源 | 类型 | 覆盖 |
-|------|------|------|
-| [Hacker News](https://news.ycombinator.com) | Firebase JSON API | 科技 / AI / 创业 |
-| [TechCrunch](https://techcrunch.com) | RSS | 科技 / 融资 / 产品 |
-| [36Kr](https://36kr.com) | RSS | 中国科技 / 创业 / 金融 |
+| 板块 | 来源 | 源权重 |
+|------|------|:---:|
+| 💰 金融 | WSJ Markets / WSJ Business | 1.2 |
+|  | CNBC Top / CNBC Finance | 1.1 |
+|  | 华尔街见闻 | 1.1 |
+|  | MarketWatch / Yahoo Finance / Investing.com | 0.9–1.0 |
+| 🤖 AI | OpenAI Blog（一手） | **1.5** |
+|  | Google AI Blog / DeepMind（一手） | 1.4 |
+|  | MIT Tech Review AI | 1.2 |
+|  | arXiv cs.AI / cs.LG / cs.CL | 1.0–1.1 |
+|  | 量子位 | 1.0 |
+| 🔬 科技 | BBC Tech | 1.1 |
+|  | Hacker News / TechCrunch / The Verge / Ars Technica / Wired / 36Kr | 1.0 |
+|  | InfoQ / 爱范儿 / GitHub Trending | 0.9 |
+|  | 少数派 | 0.8 |
+| 🌍 世界 | BBC World / NYT HomePage | 1.2 |
+
+**评分公式**：`score = (source_weight × freshness × engagement + cross_source_bonus + keyword_boost) × category_boost`
+
+- **freshness**: `exp(-hours_old / 24)`（24h 半衰期）
+- **engagement**: HN 使用 `log10(score + 2×comments)`，其余 = 1.0
+- **cross_source_bonus**: 多源命中同一事件时 +0.6 × (N−1) — 最重要的"真热度"信号
+- **keyword_boost**: 命中 `OpenAI/Fed/英伟达/发布/降息/收购` 等热词 +0.3
+- **category_boost**: AI × 1.2 / 金融 × 1.1 / 科技 × 1.0 / 世界 × 0.9
+
+**去重**: 标题相似度 ≥ 0.5 的聚类合并，来源字段合并（英文 token + 中文 bigram 双重 Jaccard）。
 
 ---
 
