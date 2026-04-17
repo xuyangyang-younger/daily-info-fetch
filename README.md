@@ -8,12 +8,13 @@
 
 ## 功能概述
 
-- 🌐 **多源并行抓取**：29 个信息源（HN API + RSS + GitHub Trending HTML），单源失败不阻塞
+- 🌐 **多源并行抓取**：34 个信息源（HN Algolia API + RSS + GitHub Trending HTML），单源失败不阻塞，带 wall-clock 预算
 - 🏷️ **自动分类**：关键词归入 `finance` / `ai` / `tech` / `world` 四大板块
-- ⚖️ **权重排序**：源权重 × 新鲜度 × 热度 + **交叉源奖励** + 关键词加分 × 板块系数
-- 🔀 **交叉验证去重**：标题相似度聚类（英文 token + 中文 bigram Jaccard），多源命中的事件自动加权
-- 🧠 **LLM 摘要**：Hermes Agent 根据评分挑选 5–9 条精选，附原始来源列表
-- 📱 **微信投递**：Hermes iLink Bot adapter (`send_weixin_direct`)
+- ⚖️ **权重排序**：源权重 × 新鲜度 × 热度（HN 加 cap）+ 交叉源奖励（按 family 去重）+ 关键词加分 × 板块系数
+- 🔀 **交叉验证去重**：倒排索引 + 标题相似度（英文 token + 中文 bigram Jaccard），URL 归一化精确去重
+- 🕑 **跨会话去重**：持久化最近 36h 已发条目，早/晚两次推送不再重复
+- 🧠 **LLM 摘要**：Hermes Agent 挑选 6–10 条精选，附原始来源列表
+- 📱 **微信投递**：Hermes iLink Bot adapter；解析 `ret` 字段检测 context token 静默失败
 - ⏰ **定时调度**：Hermes 内置 cron scheduler（无需系统 crontab）
 
 ---
@@ -79,7 +80,7 @@ Bluesky 社交平台被攻击近 24 小时……
 
 ---
 
-## 新闻来源（29 个，并行抓取）
+## 新闻来源（34 个，并行抓取）
 
 | 板块 | 来源 | 源权重 |
 |------|------|:---:|
@@ -98,15 +99,17 @@ Bluesky 社交平台被攻击近 24 小时……
 |  | 少数派 | 0.8 |
 | 🌍 世界 | BBC World / NYT HomePage | 1.2 |
 
-**评分公式**：`score = (source_weight × freshness × engagement + cross_source_bonus + keyword_boost) × category_boost`
+**评分公式**：`score = (source_weight × freshness × min(HN_cap, engagement) + cross_source_bonus + keyword_boost) × category_boost`
 
 - **freshness**: `exp(-hours_old / 24)`（24h 半衰期）
-- **engagement**: HN 使用 `log10(score + 2×comments)`，其余 = 1.0
-- **cross_source_bonus**: 多源命中同一事件时 +0.6 × (N−1) — 最重要的"真热度"信号
+- **engagement**: HN 使用 `log10(score + 2×comments)`，上限 2.0 防止屠榜；其余源 = 1.0
+- **cross_source_bonus**: 按 **source family** 去重后，多源命中同一事件时 +0.6 × (N−1) — 最重要的"真热度"信号（WSJ Markets + WSJ Business 算同一 family）
 - **keyword_boost**: 命中 `OpenAI/Fed/英伟达/发布/降息/收购` 等热词 +0.3
 - **category_boost**: AI × 1.2 / 金融 × 1.1 / 科技 × 1.0 / 世界 × 0.9
 
-**去重**: 标题相似度 ≥ 0.5 的聚类合并，来源字段合并（英文 token + 中文 bigram 双重 Jaccard）。
+**会话内去重**: 倒排索引 + 标题 Jaccard ≥ 0.55（共享 token ≥ 2）聚类合并；normalized URL 命中则直接合并。代表标题一经确立不漂移。
+
+**跨会话去重**: 成功投递后把条目 hash 写入 `~/daily-news-digest/state/sent_titles.json`，下次启动时过滤相似度 ≥ 0.6 的历史条目（保留 36h）。
 
 ---
 
@@ -115,6 +118,7 @@ Bluesky 社交平台被攻击近 24 小时……
 ```
 daily-info-fetch/
 ├── daily_news.py   # 主脚本：抓取 + 摘要 + 发送
+├── .env.example    # 环境变量模板（生产值放服务器 .env，不进 git）
 ├── README.md       # 本文档
 └── .gitignore
 ```
@@ -252,15 +256,35 @@ ssh root@47.116.69.234 \
 
 ## 配置变量
 
-脚本通过环境变量配置，默认值已内置（生产值）：
+脚本通过环境变量配置；**不再内置生产默认值**（避免密钥写入仓库）。参考 `.env.example` 复制一份 `.env` 并填入真实值。
 
-| 变量 | 用途 |
-|------|------|
-| `HERMES_API_URL` | Hermes `/v1/chat/completions` 端点 |
-| `HERMES_API_KEY` | Hermes Bearer token |
-| `WEIXIN_TOKEN` | iLink Bot token（形如 `xxx@im.bot:xxxxxx`） |
-| `WEIXIN_CHAT_ID` | 目标用户/群（形如 `xxx@im.wechat`） |
-| `WEIXIN_ACCOUNT_ID` | Bot 账号 ID（形如 `xxx@im.bot`） |
+| 变量 | 必填 | 用途 |
+|------|:---:|------|
+| `HERMES_API_URL` | ○ | Hermes `/v1/chat/completions` 端点（默认 `http://localhost:8000/...`） |
+| `HERMES_API_KEY` | ● | Hermes Bearer token |
+| `WEIXIN_TOKEN` | ●* | iLink Bot token（形如 `xxx@im.bot:xxxxxx`） |
+| `WEIXIN_CHAT_ID` | ●* | 目标用户/群（形如 `xxx@im.wechat`） |
+| `WEIXIN_ACCOUNT_ID` | ●* | Bot 账号 ID（形如 `xxx@im.bot`） |
+| `HERMES_AGENT_PATH` | ○ | Hermes agent 源码目录（默认 `/root/.hermes/hermes-agent`） |
+| `DAILY_NEWS_LOG_DIR` | ○ | 日志目录（默认 `~/daily-news-digest/logs`，5MB × 5 轮转） |
+| `DAILY_NEWS_STATE_DIR` | ○ | 跨会话去重状态目录（默认 `~/daily-news-digest/state`） |
+| `DAILY_NEWS_FETCH_TIMEOUT` | ○ | 单源超时秒数（默认 10） |
+| `DAILY_NEWS_FETCH_BUDGET` | ○ | 全部抓取的 wall-clock 预算秒数（默认 20，超出源被丢弃） |
+
+\* `WEIXIN_*` 在 `--stdout` 模式下可不填（Hermes agent 会读 stdout 自行投递）。
+
+## CLI
+
+```bash
+# 完整流程：抓取 + 摘要 + 微信发送
+daily_news.py
+
+# 仅生成摘要并打印到 stdout（供 Hermes agent cron job 调用）
+daily_news.py --stdout
+
+# 调试：禁用跨会话去重（不跳过最近 36h 已发条目）
+daily_news.py --no-history
+```
 
 ---
 
@@ -268,10 +292,12 @@ ssh root@47.116.69.234 \
 
 | 现象 | 可能原因 | 解决方法 |
 |------|----------|----------|
-| 日志 `success: True` 但微信没消息 | context token 过期，iLink 返回 `ret:-2` | 在微信给 bot 发一条消息即可 |
+| 脚本启动退 code 2 `Missing required env var` | 未配置 `.env` 或未 export 变量 | 按 `.env.example` 填好；或在 cron job 的 shell 里 export |
+| 日志 `iLink returned ret=-2` 且脚本 exit 1 | context token 过期 | 在微信给 bot 发一条消息即可；脚本现在会真·检测并失败退出 |
 | LLM 摘要为空 / 超时 | Hermes agent 模型繁忙 | 重试；检查 `http://localhost:8000/health` |
-| `HN: fetched 0 stories` | Firebase 被墙 / 网络抖动 | 重试；其它源仍可独立工作 |
-| `36Kr RSS fetch failed` | RSS 结构变化 / 反爬 | 暂时只看 HN + TechCrunch，不影响整体 |
+| `Fetch timed out (20s budget) for sources: ...` | 该源网络慢 / 被墙 | 正常丢弃不影响整体；必要时增大 `DAILY_NEWS_FETCH_BUDGET` |
+| `HN: fetched 0 stories` | Algolia API 不可达 | 重试；其它源仍可独立工作 |
+| `36Kr RSS fetch failed` | RSS 结构变化 / 反爬 | 该源临时丢弃，不影响整体 |
 | cron 未触发 | Hermes gateway 服务未运行 | `systemctl --user status hermes-gateway` |
 
 ---

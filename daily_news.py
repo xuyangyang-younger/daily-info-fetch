@@ -3,12 +3,12 @@
 Daily News Digest — 每日新闻多源抓取 + 权重排序 + 中文摘要推送
 
 Pipeline:
-  1. 并行抓取 12+ 信息源（HN API / RSS / GitHub Trending HTML）
+  1. 并行抓取 29 个信息源（HN Algolia / RSS / GitHub Trending HTML），带 wall-clock 预算
   2. 自动分类（finance / ai / tech / world）
-  3. 打分 & 交叉验证（源权重 × 新鲜度 × 热度 + 交叉源奖励 + 关键词加分）
-  4. 去重合并（同一事件的不同源合并，附交叉源列表）
-  5. 每板块 top-N 送入 Hermes LLM 生成中文速递
-  6. 通过 Hermes send_weixin_direct 推送微信
+  3. 倒排索引去重 + URL 归一化；跨会话过滤最近 36h 已发条目
+  4. 打分（源权重 × 新鲜度 × 热度[HN 有 cap] + family 交叉奖励 + 关键词）
+  5. 每板块 top-N 送入 Hermes LLM 生成中文速递（硬截断 3500 字符）
+  6. 通过 Hermes send_weixin_direct 推送微信，解析 iLink ret 检测静默失败
 """
 
 import json
@@ -17,23 +17,35 @@ import re
 import sys
 import math
 import logging
+import logging.handlers
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 import html
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
-sys.path.insert(0, "/root/.hermes/hermes-agent")
+# Hermes venv import path (server-side only; harmless if missing locally)
+_HERMES_AGENT_PATH = os.getenv("HERMES_AGENT_PATH", "/root/.hermes/hermes-agent")
+if os.path.isdir(_HERMES_AGENT_PATH):
+    sys.path.insert(0, _HERMES_AGENT_PATH)
 
 # ── Logging ────────────────────────────────────────────────────────
-LOG_DIR = os.path.expanduser("~/daily-news-digest/logs")
+LOG_DIR = os.path.expanduser(os.getenv("DAILY_NEWS_LOG_DIR", "~/daily-news-digest/logs"))
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(LOG_DIR, "daily_news.log")),
+        logging.handlers.RotatingFileHandler(
+            os.path.join(LOG_DIR, "daily_news.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
         logging.StreamHandler(),
     ],
 )
@@ -41,15 +53,46 @@ log = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────
 HERMES_API_URL = os.getenv("HERMES_API_URL", "http://localhost:8000/v1/chat/completions")
-HERMES_API_KEY = os.getenv("HERMES_API_KEY", "REDACTED_HERMES_KEY")
+HERMES_API_KEY = os.getenv("HERMES_API_KEY")
 
-WEIXIN_TOKEN = os.getenv("WEIXIN_TOKEN", "b28d654c09d9@im.bot:REDACTED_WEIXIN_TOKEN")
-WEIXIN_CHAT_ID = os.getenv("WEIXIN_CHAT_ID", "o9cq80wJs4pU5Dbx0YV-5anUXC04@im.wechat")
-WEIXIN_ACCOUNT_ID = os.getenv("WEIXIN_ACCOUNT_ID", "b28d654c09d9@im.bot")
+WEIXIN_TOKEN = os.getenv("WEIXIN_TOKEN")
+WEIXIN_CHAT_ID = os.getenv("WEIXIN_CHAT_ID")
+WEIXIN_ACCOUNT_ID = os.getenv("WEIXIN_ACCOUNT_ID")
 
-FETCH_TIMEOUT = 10
+FETCH_TIMEOUT = int(os.getenv("DAILY_NEWS_FETCH_TIMEOUT", "10"))
+FETCH_WALL_BUDGET = int(os.getenv("DAILY_NEWS_FETCH_BUDGET", "20"))
 BJT = timezone(timedelta(hours=8))
 UA = "Mozilla/5.0 (compatible; DailyNewsBot/2.0)"
+STATE_DIR = os.path.expanduser(os.getenv("DAILY_NEWS_STATE_DIR", "~/daily-news-digest/state"))
+
+# ── Shared HTTP Session ────────────────────────────────────────────
+# Connection pooling + automatic retry with exponential backoff.
+# All fetchers MUST go through HTTP (not requests.*) to benefit.
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        backoff_factor=0.3,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update({"User-Agent": UA})
+    return s
+
+
+HTTP = _build_session()
+
+
+def _require_env(name: str, value):
+    if not value:
+        log.error("Missing required env var: %s (see .env.example)", name)
+        sys.exit(2)
 
 # ═══════════════════════════════════════════════════════════════════
 #  SOURCE REGISTRY
@@ -57,46 +100,48 @@ UA = "Mozilla/5.0 (compatible; DailyNewsBot/2.0)"
 #  cat:    默认板块归属 (仍会被关键词分类覆盖)
 #  type:   hn_api / rss / gh_trending
 # ═══════════════════════════════════════════════════════════════════
+# `family` 用于跨源交叉验证奖励：同 family 的多条不算"独立交叉源"
+# （例如 WSJ Markets + WSJ Business 属 family=wsj → 算 1 个交叉源）
 SOURCES = [
     # ─ Finance ─────────────────────────────────────
-    {"name": "WSJ Markets",       "type": "rss",   "url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",                "weight": 1.2, "cat": "finance", "max": 8},
-    {"name": "WSJ Business",      "type": "rss",   "url": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",              "weight": 1.2, "cat": "finance", "max": 8},
-    {"name": "CNBC Top",          "type": "rss",   "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html",         "weight": 1.1, "cat": "finance", "max": 10},
-    {"name": "CNBC Finance",      "type": "rss",   "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html",          "weight": 1.1, "cat": "finance", "max": 10},
-    {"name": "MarketWatch",       "type": "rss",   "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories",    "weight": 1.0, "cat": "finance", "max": 8},
-    {"name": "Investing CN",      "type": "rss",   "url": "https://cn.investing.com/rss/news_285.rss",                     "weight": 0.9, "cat": "finance", "max": 8},
-    {"name": "华尔街见闻",         "type": "rss",   "url": "https://dedicated.wallstreetcn.com/rss.xml",                    "weight": 1.1, "cat": "finance", "max": 15},
+    {"name": "WSJ Markets",       "family": "wsj",     "type": "rss",   "url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",                "weight": 1.2, "cat": "finance", "max": 8},
+    {"name": "WSJ Business",      "family": "wsj",     "type": "rss",   "url": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",              "weight": 1.2, "cat": "finance", "max": 8},
+    {"name": "CNBC Top",          "family": "cnbc",    "type": "rss",   "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html",         "weight": 1.1, "cat": "finance", "max": 10},
+    {"name": "CNBC Finance",      "family": "cnbc",    "type": "rss",   "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html",          "weight": 1.1, "cat": "finance", "max": 10},
+    {"name": "MarketWatch",       "family": "marketwatch", "type": "rss", "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories", "weight": 1.0, "cat": "finance", "max": 8},
+    {"name": "Investing CN",      "family": "investing", "type": "rss", "url": "https://cn.investing.com/rss/news_285.rss",                     "weight": 0.9, "cat": "finance", "max": 8},
+    {"name": "华尔街见闻",         "family": "wallstreetcn", "type": "rss", "url": "https://dedicated.wallstreetcn.com/rss.xml",                "weight": 1.1, "cat": "finance", "max": 15},
 
     # ─ AI (一手源权重最高) ──────────────────────────
-    {"name": "OpenAI Blog",       "type": "rss",   "url": "https://openai.com/blog/rss.xml",                               "weight": 1.5, "cat": "ai",      "max": 5},
-    {"name": "Google AI Blog",    "type": "rss",   "url": "https://blog.google/technology/ai/rss/",                        "weight": 1.4, "cat": "ai",      "max": 5},
-    {"name": "DeepMind",          "type": "rss",   "url": "https://deepmind.google/blog/rss.xml",                          "weight": 1.4, "cat": "ai",      "max": 5},
-    {"name": "MIT Tech Review AI","type": "rss",   "url": "https://www.technologyreview.com/topic/artificial-intelligence/feed", "weight": 1.2, "cat": "ai", "max": 5},
-    {"name": "VentureBeat AI",    "type": "rss",   "url": "https://venturebeat.com/category/ai/feed/",                     "weight": 1.1, "cat": "ai",      "max": 7},
-    {"name": "Simon Willison",    "type": "rss",   "url": "https://simonwillison.net/atom/everything/",                    "weight": 1.2, "cat": "ai",      "max": 6},
-    {"name": "arXiv cs.AI",       "type": "rss",   "url": "http://export.arxiv.org/rss/cs.AI",                             "weight": 1.1, "cat": "ai",      "max": 6},
-    {"name": "arXiv cs.LG",       "type": "rss",   "url": "http://export.arxiv.org/rss/cs.LG",                             "weight": 1.0, "cat": "ai",      "max": 4},
-    {"name": "arXiv cs.CL",       "type": "rss",   "url": "http://export.arxiv.org/rss/cs.CL",                             "weight": 1.0, "cat": "ai",      "max": 4},
-    {"name": "量子位",             "type": "rss",   "url": "https://www.qbitai.com/feed",                                   "weight": 1.0, "cat": "ai",      "max": 8},
+    {"name": "OpenAI Blog",       "family": "openai",  "type": "rss",   "url": "https://openai.com/blog/rss.xml",                               "weight": 1.5, "cat": "ai",      "max": 5},
+    {"name": "Google AI Blog",    "family": "google",  "type": "rss",   "url": "https://blog.google/technology/ai/rss/",                        "weight": 1.4, "cat": "ai",      "max": 5},
+    {"name": "DeepMind",          "family": "google",  "type": "rss",   "url": "https://deepmind.google/blog/rss.xml",                          "weight": 1.4, "cat": "ai",      "max": 5},
+    {"name": "MIT Tech Review AI","family": "mitreview","type": "rss",  "url": "https://www.technologyreview.com/topic/artificial-intelligence/feed", "weight": 1.2, "cat": "ai", "max": 5},
+    {"name": "VentureBeat AI",    "family": "venturebeat", "type": "rss", "url": "https://venturebeat.com/category/ai/feed/",                   "weight": 1.1, "cat": "ai",      "max": 7},
+    {"name": "Simon Willison",    "family": "simonw",  "type": "rss",   "url": "https://simonwillison.net/atom/everything/",                    "weight": 1.2, "cat": "ai",      "max": 6},
+    {"name": "arXiv cs.AI",       "family": "arxiv",   "type": "rss",   "url": "http://export.arxiv.org/rss/cs.AI",                             "weight": 1.1, "cat": "ai",      "max": 6},
+    {"name": "arXiv cs.LG",       "family": "arxiv",   "type": "rss",   "url": "http://export.arxiv.org/rss/cs.LG",                             "weight": 1.0, "cat": "ai",      "max": 4},
+    {"name": "arXiv cs.CL",       "family": "arxiv",   "type": "rss",   "url": "http://export.arxiv.org/rss/cs.CL",                             "weight": 1.0, "cat": "ai",      "max": 4},
+    {"name": "量子位",             "family": "qbitai",  "type": "rss",   "url": "https://www.qbitai.com/feed",                                   "weight": 1.0, "cat": "ai",      "max": 8},
 
     # ─ Tech ────────────────────────────────────────
-    {"name": "Hacker News",       "type": "hn_api","url": "",                                                              "weight": 1.0, "cat": "tech",    "max": 20},
-    {"name": "TechCrunch",        "type": "rss",   "url": "https://techcrunch.com/feed/",                                  "weight": 1.0, "cat": "tech",    "max": 10},
-    {"name": "The Verge",         "type": "rss",   "url": "https://www.theverge.com/rss/index.xml",                        "weight": 1.0, "cat": "tech",    "max": 10},
-    {"name": "Ars Technica",      "type": "rss",   "url": "https://feeds.arstechnica.com/arstechnica/index",               "weight": 1.0, "cat": "tech",    "max": 10},
-    {"name": "Wired",             "type": "rss",   "url": "https://www.wired.com/feed/rss",                                "weight": 1.0, "cat": "tech",    "max": 10},
-    {"name": "VentureBeat",       "type": "rss",   "url": "https://venturebeat.com/feed/",                                 "weight": 1.0, "cat": "tech",    "max": 7},
-    {"name": "Stratechery",       "type": "rss",   "url": "https://stratechery.com/feed/",                                 "weight": 1.2, "cat": "tech",    "max": 5},
-    {"name": "InfoQ",             "type": "rss",   "url": "https://feed.infoq.com/",                                       "weight": 0.9, "cat": "tech",    "max": 8},
-    {"name": "Hacker Noon",       "type": "rss",   "url": "https://hackernoon.com/feed",                                   "weight": 0.8, "cat": "tech",    "max": 8},
-    {"name": "TechNode",          "type": "rss",   "url": "https://technode.com/feed/",                                    "weight": 0.9, "cat": "tech",    "max": 8},
-    {"name": "36Kr",              "type": "rss",   "url": "https://36kr.com/feed",                                         "weight": 1.0, "cat": "tech",    "max": 10},
-    {"name": "爱范儿",             "type": "rss",   "url": "https://www.ifanr.com/feed",                                    "weight": 0.9, "cat": "tech",    "max": 8},
-    {"name": "钛媒体",             "type": "rss",   "url": "https://www.tmtpost.com/rss.xml",                               "weight": 0.9, "cat": "tech",    "max": 8},
-    {"name": "雷锋网",             "type": "rss",   "url": "https://www.leiphone.com/feed",                                 "weight": 0.9, "cat": "tech",    "max": 8},
-    {"name": "Solidot",           "type": "rss",   "url": "https://www.solidot.org/index.rss",                             "weight": 0.9, "cat": "tech",    "max": 10},
-    {"name": "少数派",             "type": "rss",   "url": "https://sspai.com/feed",                                        "weight": 0.8, "cat": "tech",    "max": 6},
-    {"name": "GitHub Trending",   "type": "gh_trending", "url": "https://github.com/trending?since=daily",                 "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "Hacker News",       "family": "hn",      "type": "hn_api","url": "",                                                              "weight": 1.0, "cat": "tech",    "max": 20},
+    {"name": "TechCrunch",        "family": "techcrunch", "type": "rss", "url": "https://techcrunch.com/feed/",                                "weight": 1.0, "cat": "tech",    "max": 10},
+    {"name": "The Verge",         "family": "verge",   "type": "rss",   "url": "https://www.theverge.com/rss/index.xml",                        "weight": 1.0, "cat": "tech",    "max": 10},
+    {"name": "Ars Technica",      "family": "ars",     "type": "rss",   "url": "https://feeds.arstechnica.com/arstechnica/index",               "weight": 1.0, "cat": "tech",    "max": 10},
+    {"name": "Wired",             "family": "wired",   "type": "rss",   "url": "https://www.wired.com/feed/rss",                                "weight": 1.0, "cat": "tech",    "max": 10},
+    {"name": "VentureBeat",       "family": "venturebeat", "type": "rss", "url": "https://venturebeat.com/feed/",                               "weight": 1.0, "cat": "tech",    "max": 7},
+    {"name": "Stratechery",       "family": "stratechery", "type": "rss", "url": "https://stratechery.com/feed/",                               "weight": 1.2, "cat": "tech",    "max": 5},
+    {"name": "InfoQ",             "family": "infoq",   "type": "rss",   "url": "https://feed.infoq.com/",                                       "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "Hacker Noon",       "family": "hackernoon", "type": "rss", "url": "https://hackernoon.com/feed",                                  "weight": 0.8, "cat": "tech",    "max": 8},
+    {"name": "TechNode",          "family": "technode","type": "rss",   "url": "https://technode.com/feed/",                                    "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "36Kr",              "family": "36kr",    "type": "rss",   "url": "https://36kr.com/feed",                                         "weight": 1.0, "cat": "tech",    "max": 10},
+    {"name": "爱范儿",             "family": "ifanr",   "type": "rss",   "url": "https://www.ifanr.com/feed",                                    "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "钛媒体",             "family": "tmtpost", "type": "rss",   "url": "https://www.tmtpost.com/rss.xml",                               "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "雷锋网",             "family": "leiphone","type": "rss",   "url": "https://www.leiphone.com/feed",                                 "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "Solidot",           "family": "solidot", "type": "rss",   "url": "https://www.solidot.org/index.rss",                             "weight": 0.9, "cat": "tech",    "max": 10},
+    {"name": "少数派",             "family": "sspai",   "type": "rss",   "url": "https://sspai.com/feed",                                        "weight": 0.8, "cat": "tech",    "max": 6},
+    {"name": "GitHub Trending",   "family": "github",  "type": "gh_trending", "url": "https://github.com/trending?since=daily",                 "weight": 0.9, "cat": "tech",    "max": 8},
 ]
 
 
@@ -131,34 +176,38 @@ def _parse_date(s):
 
 
 def fetch_hn(src):
+    """HN via Algolia front-page API — 一次请求拿全 top N，避免 1+N 次 Firebase 往返。"""
     try:
-        ids = requests.get(
-            "https://hacker-news.firebaseio.com/v0/topstories.json",
+        r = HTTP.get(
+            "https://hn.algolia.com/api/v1/search",
+            params={"tags": "front_page", "hitsPerPage": src["max"]},
             timeout=FETCH_TIMEOUT,
-        ).json()[: src["max"]]
+        )
+        r.raise_for_status()
+        hits = r.json().get("hits", [])
         stories = []
-        # Parallel fetch HN items
-        def _get(sid):
-            return requests.get(
-                f"https://hacker-news.firebaseio.com/v0/item/{sid}.json",
-                timeout=FETCH_TIMEOUT,
-            ).json()
-
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            for item in ex.map(_get, ids):
-                if not item or not item.get("title"):
-                    continue
-                stories.append({
-                    "title": item["title"],
-                    "url": item.get("url") or f"https://news.ycombinator.com/item?id={item['id']}",
-                    "description": "",
-                    "source": src["name"],
-                    "source_weight": src["weight"],
-                    "default_cat": src["cat"],
-                    "published": datetime.fromtimestamp(item.get("time", 0), tz=timezone.utc) if item.get("time") else None,
-                    "hn_score": item.get("score", 0),
-                    "hn_comments": item.get("descendants", 0),
-                })
+        for item in hits:
+            title = item.get("title") or item.get("story_title")
+            if not title:
+                continue
+            obj_id = item.get("objectID") or item.get("story_id") or ""
+            url = item.get("url") or item.get("story_url") or f"https://news.ycombinator.com/item?id={obj_id}"
+            pub = None
+            ts = item.get("created_at_i")
+            if ts:
+                pub = datetime.fromtimestamp(ts, tz=timezone.utc)
+            stories.append({
+                "title": title,
+                "url": url,
+                "description": "",
+                "source": src["name"],
+                "source_family": src["family"],
+                "source_weight": src["weight"],
+                "default_cat": src["cat"],
+                "published": pub,
+                "hn_score": item.get("points", 0) or 0,
+                "hn_comments": item.get("num_comments", 0) or 0,
+            })
         return stories
     except Exception as e:
         log.warning("[%s] fetch failed: %s", src["name"], e)
@@ -167,7 +216,7 @@ def fetch_hn(src):
 
 def fetch_rss(src):
     try:
-        r = requests.get(src["url"], timeout=FETCH_TIMEOUT, headers={"User-Agent": UA})
+        r = HTTP.get(src["url"], timeout=FETCH_TIMEOUT)
         r.raise_for_status()
         root = ET.fromstring(r.content)
         ns = {"atom": "http://www.w3.org/2005/Atom", "dc": "http://purl.org/dc/elements/1.1/"}
@@ -201,6 +250,7 @@ def fetch_rss(src):
                 "url": link,
                 "description": desc,
                 "source": src["name"],
+                "source_family": src["family"],
                 "source_weight": src["weight"],
                 "default_cat": src["cat"],
                 "published": _parse_date(pub),
@@ -216,7 +266,7 @@ def fetch_rss(src):
 def fetch_gh_trending(src):
     """Scrape github.com/trending HTML (no official API)."""
     try:
-        r = requests.get(src["url"], timeout=FETCH_TIMEOUT, headers={"User-Agent": UA})
+        r = HTTP.get(src["url"], timeout=FETCH_TIMEOUT)
         r.raise_for_status()
         html_text = r.text
         # Each repo is in <article class="Box-row">
@@ -237,6 +287,7 @@ def fetch_gh_trending(src):
                 "url": f"https://github.com/{repo}",
                 "description": desc[:300],
                 "source": src["name"],
+                "source_family": src["family"],
                 "source_weight": src["weight"],
                 "default_cat": src["cat"],
                 "published": datetime.now(timezone.utc),  # trending = very fresh
@@ -253,17 +304,33 @@ FETCHERS = {"hn_api": fetch_hn, "rss": fetch_rss, "gh_trending": fetch_gh_trendi
 
 
 def fetch_all():
+    """并行抓取所有源；整体 wall-clock 预算 FETCH_WALL_BUDGET 秒，超时的源丢弃。"""
     all_stories = []
     stats = {}
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    timed_out = []
+    # IO-bound: 每源一线程，max_workers=len(SOURCES) 几乎零额外代价
+    with ThreadPoolExecutor(max_workers=max(len(SOURCES), 1)) as ex:
         futures = {ex.submit(FETCHERS[s["type"]], s): s for s in SOURCES}
-        for fut in as_completed(futures):
-            src = futures[fut]
-            items = fut.result() or []
-            stats[src["name"]] = len(items)
-            all_stories.extend(items)
+        try:
+            for fut in as_completed(futures, timeout=FETCH_WALL_BUDGET):
+                src = futures[fut]
+                items = fut.result() or []
+                stats[src["name"]] = len(items)
+                all_stories.extend(items)
+        except FutureTimeout:
+            pass
+        # 处理未完成的 future：记录慢源，取消（网络层 cancel 不可靠，但计数准确）
+        for fut, src in futures.items():
+            if not fut.done():
+                timed_out.append(src["name"])
+                fut.cancel()
+
+    if timed_out:
+        log.warning("Fetch timed out (%ds budget) for sources: %s",
+                    FETCH_WALL_BUDGET, ", ".join(timed_out))
     log.info("Fetch summary: %s", {k: v for k, v in sorted(stats.items(), key=lambda x: -x[1])})
-    log.info("Total raw items: %d", len(all_stories))
+    log.info("Total raw items: %d (completed %d/%d sources)",
+             len(all_stories), len(stats), len(SOURCES))
     return all_stories
 
 
@@ -282,6 +349,12 @@ AI_KW = re.compile(
     r"大模型|人工智能|智能体|算力|推理|多模态|扩散模型",
     re.IGNORECASE,
 )
+WORLD_KW = re.compile(
+    r"\b(election|president|parliament|senate|war|conflict|strike|protest|sanction|"
+    r"treaty|UN|EU|NATO|Ukraine|Russia|Israel|Gaza|Iran|Korea|Taiwan)\b"
+    r"|大选|总统|战争|冲突|制裁|条约|联合国|欧盟|北约|乌克兰|俄罗斯|以色列|加沙|伊朗|朝鲜|台海",
+    re.IGNORECASE,
+)
 
 
 def classify(item):
@@ -290,6 +363,8 @@ def classify(item):
         return "ai"
     if FINANCE_KW.search(text):
         return "finance"
+    if WORLD_KW.search(text):
+        return "world"
     return item.get("default_cat", "tech")
 
 
@@ -308,6 +383,11 @@ HOT_KW = re.compile(
 
 STOPWORDS = {"the","a","an","of","to","in","on","for","and","or","with","is","are","be","by","as","at","from","that","this","it","its","new","has","have","will","was"}
 
+# dedup 门槛
+SIM_THRESHOLD = 0.55           # Jaccard 相似度合并阈值
+MIN_SHARED_TOKENS = 2          # 必须至少 N 个共同 token 才可能合并（抗单词误命中）
+HN_ENG_CAP = 2.0               # HN engagement 乘数上限（避免 HN 屠榜）
+
 
 def _tokens_en(s):
     toks = re.findall(r"[a-zA-Z][a-zA-Z0-9]{2,}", s.lower())
@@ -319,14 +399,51 @@ def _bigrams_zh(s):
     return {"".join(chars[i:i+2]) for i in range(len(chars)-1)}
 
 
-def similarity(a, b):
-    """Hybrid title similarity: English Jaccard ∪ Chinese bigram Jaccard."""
-    ea, eb = _tokens_en(a), _tokens_en(b)
-    za, zb = _bigrams_zh(a), _bigrams_zh(b)
-    ua, ub = ea | za, eb | zb
-    if not ua or not ub:
+def _title_tokens(title: str):
+    """返回标题的合并 token 集合（英文 token ∪ 中文 bigram），用于倒排索引 & 相似度。"""
+    return _tokens_en(title) | _bigrams_zh(title)
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
         return 0.0
-    return len(ua & ub) / len(ua | ub)
+    inter = a & b
+    if not inter:
+        return 0.0
+    return len(inter) / len(a | b)
+
+
+_TRACK_PARAMS = re.compile(r"^(utm_|fbclid|gclid|mc_cid|mc_eid|ref|spm$)", re.IGNORECASE)
+
+
+def normalize_url(url: str) -> str:
+    """归一化 URL 用于精确去重：小写 host、去除追踪参数、去 fragment、去末尾斜杠。"""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        parts = urlsplit(url.strip())
+        host = (parts.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host.startswith("m."):
+            host = host[2:]
+        netloc = host
+        if parts.port:
+            netloc = f"{host}:{parts.port}"
+        query = urlencode([
+            (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if not _TRACK_PARAMS.match(k)
+        ])
+        path = parts.path.rstrip("/") or "/"
+        return urlunsplit((parts.scheme.lower() or "https", netloc, path, query, ""))
+    except Exception:
+        return url.strip()
+
+
+# 相似度保留旧名称以防外部引用（未来移除兼容层可考虑直接用 _jaccard）
+def similarity(a, b):
+    return _jaccard(_title_tokens(a), _title_tokens(b))
 
 
 def base_score(item):
@@ -338,59 +455,109 @@ def base_score(item):
         freshness = math.exp(-hours / 24)
     else:
         freshness = 0.5  # unknown date → mild penalty
-    # 3. engagement (HN only for now)
+    # 3. engagement (HN only) — 加 cap 防止屠榜
     eng = 1.0
     if item.get("hn_score", 0) > 0:
-        eng = 1.0 + math.log10(1 + item["hn_score"] + 2 * item.get("hn_comments", 0)) / 2
+        eng = min(HN_ENG_CAP, 1.0 + math.log10(1 + item["hn_score"] + 2 * item.get("hn_comments", 0)) / 2)
     # 4. keyword boost
     text = item["title"] + " " + item.get("description", "")
     kw_bonus = 0.3 if HOT_KW.search(text) else 0.0
     return w * freshness * eng + kw_bonus
 
 
-def dedup_and_score(items):
-    """Cluster similar items by title similarity. Merge sources, sum bonus."""
-    clusters = []
+def _precompute_tokens(items):
+    """为每个 item 预计算 title_tokens 和 normalized_url（后续 dedup 直接复用）。"""
     for it in items:
-        best_i, best_sim = -1, 0.0
-        for i, c in enumerate(clusters):
-            sim = similarity(it["title"], c["title"])
-            if sim > best_sim:
-                best_sim, best_i = sim, i
-        if best_sim >= 0.5 and best_i >= 0:
-            # merge into existing cluster
-            c = clusters[best_i]
-            c["sources"].append({"name": it["source"], "url": it["url"]})
-            # keep highest-weighted representative
-            if it["source_weight"] > c["source_weight"]:
-                c["title"] = it["title"]
-                c["url"] = it["url"]
-                c["description"] = it.get("description") or c["description"]
-                c["source_weight"] = it["source_weight"]
-            elif not c["description"] and it.get("description"):
-                c["description"] = it["description"]
-            # use freshest date
-            if it.get("published") and (not c.get("published") or it["published"] > c["published"]):
-                c["published"] = it["published"]
-            # accumulate HN engagement
-            c["hn_score"] = max(c["hn_score"], it.get("hn_score", 0))
-            c["hn_comments"] = max(c["hn_comments"], it.get("hn_comments", 0))
-        else:
-            clusters.append({
-                "title": it["title"],
-                "url": it["url"],
-                "description": it.get("description", ""),
-                "source_weight": it["source_weight"],
-                "default_cat": it["default_cat"],
-                "published": it.get("published"),
-                "hn_score": it.get("hn_score", 0),
-                "hn_comments": it.get("hn_comments", 0),
-                "sources": [{"name": it["source"], "url": it["url"]}],
-            })
+        it["_tokens"] = _title_tokens(it["title"])
+        it["_nurl"] = normalize_url(it.get("url", ""))
 
-    # score each cluster
+
+def dedup_and_score(items):
+    """
+    倒排索引 + 两阶段合并:
+      1) normalized_url 精确命中 → 直接合并（同文章在不同源的同一 link）
+      2) 标题 Jaccard ≥ SIM_THRESHOLD 且共享 token ≥ MIN_SHARED_TOKENS → 聚类合并
+    代表标题一经确立不再漂移（仅在更高权重源出现时替换描述，不替换 title）。
+    """
+    _precompute_tokens(items)
+
+    clusters = []
+    token_index: dict = {}   # token -> list[cluster idx]
+    url_index: dict = {}     # normalized_url -> cluster idx
+
+    def _new_cluster(it) -> int:
+        c = {
+            "title": it["title"],                    # 代表标题：首次命中后固定
+            "url": it["url"],
+            "description": it.get("description", ""),
+            "source_weight": it["source_weight"],
+            "default_cat": it["default_cat"],
+            "published": it.get("published"),
+            "hn_score": it.get("hn_score", 0),
+            "hn_comments": it.get("hn_comments", 0),
+            "sources": [{"name": it["source"], "family": it.get("source_family", it["source"]), "url": it["url"]}],
+            "_tokens": set(it["_tokens"]),
+        }
+        clusters.append(c)
+        idx = len(clusters) - 1
+        for tok in it["_tokens"]:
+            token_index.setdefault(tok, []).append(idx)
+        if it["_nurl"]:
+            url_index[it["_nurl"]] = idx
+        return idx
+
+    def _merge_into(idx: int, it):
+        c = clusters[idx]
+        c["sources"].append({"name": it["source"], "family": it.get("source_family", it["source"]), "url": it["url"]})
+        # 代表 title 不变；仅当描述更饱满时替换，并在更高权重源出现时用其描述
+        if it["source_weight"] > c["source_weight"]:
+            if it.get("description"):
+                c["description"] = it["description"]
+            c["source_weight"] = it["source_weight"]
+        elif not c["description"] and it.get("description"):
+            c["description"] = it["description"]
+        if it.get("published") and (not c.get("published") or it["published"] > c["published"]):
+            c["published"] = it["published"]
+        c["hn_score"] = max(c["hn_score"], it.get("hn_score", 0))
+        c["hn_comments"] = max(c["hn_comments"], it.get("hn_comments", 0))
+        # 倒排索引增量更新（并入的 token 也要可被后续条目检索到）
+        for tok in it["_tokens"] - c["_tokens"]:
+            token_index.setdefault(tok, []).append(idx)
+        c["_tokens"] |= it["_tokens"]
+
+    for it in items:
+        # Stage 1: URL 精确命中
+        if it["_nurl"] and it["_nurl"] in url_index:
+            _merge_into(url_index[it["_nurl"]], it)
+            continue
+
+        # Stage 2: 倒排索引取候选 → 相似度比对
+        toks = it["_tokens"]
+        if not toks:
+            _new_cluster(it)
+            continue
+        candidate_counts: dict = {}
+        for tok in toks:
+            for ci in token_index.get(tok, ()):
+                candidate_counts[ci] = candidate_counts.get(ci, 0) + 1
+
+        best_i, best_sim = -1, 0.0
+        for ci, shared in candidate_counts.items():
+            if shared < MIN_SHARED_TOKENS:
+                continue
+            sim = _jaccard(toks, clusters[ci]["_tokens"])
+            if sim > best_sim:
+                best_sim, best_i = sim, ci
+
+        if best_i >= 0 and best_sim >= SIM_THRESHOLD:
+            _merge_into(best_i, it)
+            if it["_nurl"]:
+                url_index.setdefault(it["_nurl"], best_i)
+        else:
+            _new_cluster(it)
+
+    # 打分
     for c in clusters:
-        # classify based on merged text
         c["category"] = classify({"title": c["title"], "description": c["description"], "default_cat": c["default_cat"]})
         base = base_score({
             "source_weight": c["source_weight"],
@@ -400,11 +567,16 @@ def dedup_and_score(items):
             "title": c["title"],
             "description": c["description"],
         })
+        # cross-source bonus: 按 family 去重（WSJ Markets+Business 算同一家）
+        families = {s.get("family", s["name"]) for s in c["sources"]}
+        n_families = len(families)
         n_sources = len({s["name"] for s in c["sources"]})
-        cross_bonus = 0.6 * (n_sources - 1)  # ⭐ 关键：交叉验证奖励
+        cross_bonus = 0.6 * (n_families - 1)
         cat_mul = CATEGORY_BOOST.get(c["category"], 1.0)
         c["score"] = (base + cross_bonus) * cat_mul
         c["n_sources"] = n_sources
+        c["n_families"] = n_families
+        c.pop("_tokens", None)
 
     clusters.sort(key=lambda x: -x["score"])
     return clusters
@@ -471,8 +643,8 @@ def generate_summary(clusters):
         "（同上格式）\n\n"
         f"📊 本期覆盖多源交叉验证 | 共 {len(selected)} 条精选\n\n"
         "严格要求:\n"
-        "- 从素材中挑选 9-13 条最有价值的新闻（优先高 score 和多源交叉的）\n"
-        "- 金融 3-4 条 / AI 3-5 条 / 科技 3-4 条\n"
+        "- 从素材中挑选 6-10 条最有价值的新闻（优先高 score 和多源交叉的）\n"
+        "- 金融 2-3 条 / AI 2-4 条 / 科技 2-3 条（若某板块素材不足可减少）\n"
         "- 每条摘要 2-3 句话（60-120 字），标题不超过 15 字\n"
         "- 📎 来源行必须原样保留素材中给出的来源列表\n"
         "- 全文控制在 3500 字符以内\n"
@@ -484,7 +656,7 @@ def generate_summary(clusters):
     )
 
     try:
-        r = requests.post(
+        r = HTTP.post(
             HERMES_API_URL,
             headers={
                 "Authorization": "Bearer " + HERMES_API_KEY,
@@ -498,6 +670,10 @@ def generate_summary(clusters):
         )
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
+        # 硬截断保护：微信侧长消息可能被 iLink 静默截断
+        if len(content) > 3500:
+            log.warning("LLM output %d chars exceeds 3500 limit; truncating", len(content))
+            content = content[:3497] + "..."
         log.info("LLM summary generated: %d chars", len(content))
         return content, selected
     except Exception as e:
@@ -506,8 +682,106 @@ def generate_summary(clusters):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  CROSS-SESSION DEDUP (persisted "already-sent" state)
+# ═══════════════════════════════════════════════════════════════════
+
+SENT_STATE_PATH = os.path.join(STATE_DIR, "sent_titles.json")
+SENT_RETENTION_HOURS = 36
+SENT_SIM_THRESHOLD = 0.6       # 跨会话去重更严格（避免误杀）
+
+
+def _title_hash(title: str) -> str:
+    import hashlib
+    return hashlib.sha1(title.strip().lower().encode("utf-8")).hexdigest()[:16]
+
+
+def load_sent_history():
+    """Return list of {hash, title, tokens, ts_iso}. 丢弃超过保留窗口的条目。"""
+    try:
+        with open(SENT_STATE_PATH, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=SENT_RETENTION_HOURS)
+    fresh = []
+    for rec in records:
+        try:
+            ts = datetime.fromisoformat(rec["ts"])
+            if ts >= cutoff:
+                rec["_tokens"] = set(rec.get("tokens", []))
+                fresh.append(rec)
+        except Exception:
+            continue
+    return fresh
+
+
+def filter_recently_sent(clusters, history):
+    """过滤与最近 36h 已发条目相似度 ≥ SENT_SIM_THRESHOLD 的 cluster。"""
+    if not history:
+        return clusters, 0
+    kept = []
+    skipped = 0
+    for c in clusters:
+        toks = _title_tokens(c["title"])
+        hit = False
+        for rec in history:
+            if _jaccard(toks, rec["_tokens"]) >= SENT_SIM_THRESHOLD:
+                hit = True
+                break
+        if hit:
+            skipped += 1
+        else:
+            kept.append(c)
+    return kept, skipped
+
+
+def save_sent_history(selected, history):
+    """把本次 selected 合并到历史，写回磁盘。"""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    records = [
+        {"hash": r["hash"], "title": r["title"], "tokens": list(r["_tokens"]), "ts": r["ts"]}
+        for r in history
+    ]
+    seen_hashes = {r["hash"] for r in records}
+    for c in selected:
+        h = _title_hash(c["title"])
+        if h in seen_hashes:
+            continue
+        records.append({
+            "hash": h,
+            "title": c["title"],
+            "tokens": list(_title_tokens(c["title"])),
+            "ts": now_iso,
+        })
+    try:
+        with open(SENT_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        log.info("Sent history persisted: %d records → %s", len(records), SENT_STATE_PATH)
+    except Exception as e:
+        log.warning("Failed to persist sent history: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  WECHAT SENDING
 # ═══════════════════════════════════════════════════════════════════
+
+def _scan_ret_code(obj):
+    """递归查找响应中的 iLink ret 字段（HTTP 200 也可能 ret != 0 即静默失败）。"""
+    if isinstance(obj, dict):
+        if "ret" in obj and isinstance(obj["ret"], (int, float)):
+            return int(obj["ret"])
+        for v in obj.values():
+            code = _scan_ret_code(v)
+            if code is not None:
+                return code
+    elif isinstance(obj, list):
+        for v in obj:
+            code = _scan_ret_code(v)
+            if code is not None:
+                return code
+    return None
+
 
 def send_to_wechat(text):
     import asyncio
@@ -528,7 +802,15 @@ def send_to_wechat(text):
     try:
         result = asyncio.run(_send())
         log.info("WeChat send result: %s", result)
-        return result.get("success", False)
+        if not (isinstance(result, dict) and result.get("success")):
+            return False
+        ret_code = _scan_ret_code(result)
+        if ret_code is not None and ret_code != 0:
+            # 常见：-2 = context token 过期，消息静默丢弃。见 README "context token 刷新"章节
+            log.error("iLink returned ret=%d (context token may be expired; "
+                      "发条消息给 bot 账号可刷新 token)", ret_code)
+            return False
+        return True
     except Exception as e:
         log.error("WeChat send failed: %s", e)
         return False
@@ -538,26 +820,49 @@ def send_to_wechat(text):
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
+def parse_args():
+    import argparse
+    p = argparse.ArgumentParser(description="Daily news digest fetcher")
+    p.add_argument("--stdout", action="store_true",
+                   help="仅生成摘要并打印到 stdout，跳过微信发送（供 Hermes agent 调用）")
+    p.add_argument("--no-history", action="store_true",
+                   help="禁用跨会话去重（调试用）")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
     log.info("=" * 60)
-    log.info("Daily News Digest v2 starting...")
+    log.info("Daily News Digest v2 starting (stdout=%s)", args.stdout)
     now = datetime.now(BJT)
     log.info("Time: %s BJT", now.strftime("%Y-%m-%d %H:%M:%S"))
 
+    # 0. 必需凭据校验（--stdout 模式下可跳过微信相关）
+    _require_env("HERMES_API_KEY", HERMES_API_KEY)
+    if not args.stdout:
+        _require_env("WEIXIN_TOKEN", WEIXIN_TOKEN)
+        _require_env("WEIXIN_CHAT_ID", WEIXIN_CHAT_ID)
+        _require_env("WEIXIN_ACCOUNT_ID", WEIXIN_ACCOUNT_ID)
+
     # 1. Fetch
-    log.info("Step 1/4: Fetching from %d sources (parallel)...", len(SOURCES))
+    log.info("Step 1/4: Fetching from %d sources (parallel, budget=%ds)...",
+             len(SOURCES), FETCH_WALL_BUDGET)
     raw = fetch_all()
     if not raw:
         log.error("No items from any source. Aborting.")
         sys.exit(1)
 
-    # 2. Classify
-    log.info("Step 2/4: Classifying & scoring...")
-    for it in raw:
-        it["_cat"] = classify(it)
-
-    # 3. Dedup + score
+    # 2. Dedup + score
+    log.info("Step 2/4: Classifying, dedup & scoring...")
     clusters = dedup_and_score(raw)
+
+    # 2.5. 跨会话去重：过滤最近 36h 已发送的相似条目
+    history = [] if args.no_history else load_sent_history()
+    if history:
+        clusters, skipped = filter_recently_sent(clusters, history)
+        if skipped:
+            log.info("Cross-session dedup: skipped %d recently-sent clusters", skipped)
+
     by_cat = {}
     for c in clusters:
         by_cat.setdefault(c["category"], []).append(c)
@@ -568,7 +873,7 @@ def main():
                  cat, len(items),
                  " / ".join(f"{t['title'][:30]}(s={t['score']:.2f},n={t['n_sources']})" for t in top))
 
-    # 4. Summarize
+    # 3. Summarize
     log.info("Step 3/4: LLM summarization...")
     summary, selected = generate_summary(clusters)
     if not summary:
@@ -577,10 +882,19 @@ def main():
     log.info("Summary %d chars | selected %d items", len(summary), len(selected))
     log.info("--- preview ---\n%s\n--- end ---", summary[:600])
 
-    # 5. Send
+    # 4. Deliver
+    if args.stdout:
+        # 供 Hermes agent 读取后自行投递（见 README 中 cron job prompt）
+        sys.stdout.write(summary)
+        sys.stdout.flush()
+        save_sent_history(selected, history)
+        log.info("=" * 60)
+        return
+
     log.info("Step 4/4: Sending to WeChat...")
     ok = send_to_wechat(summary)
     if ok:
+        save_sent_history(selected, history)
         log.info("✅ Digest sent successfully")
     else:
         log.error("❌ Failed to send digest")
