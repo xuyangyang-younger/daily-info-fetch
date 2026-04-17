@@ -64,8 +64,7 @@ SOURCES = [
     {"name": "CNBC Top",          "type": "rss",   "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html",         "weight": 1.1, "cat": "finance", "max": 10},
     {"name": "CNBC Finance",      "type": "rss",   "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html",          "weight": 1.1, "cat": "finance", "max": 10},
     {"name": "MarketWatch",       "type": "rss",   "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories",    "weight": 1.0, "cat": "finance", "max": 8},
-    {"name": "Yahoo Finance",     "type": "rss",   "url": "https://finance.yahoo.com/news/rssindex",                       "weight": 0.9, "cat": "finance", "max": 10},
-    {"name": "Investing.com",     "type": "rss",   "url": "https://www.investing.com/rss/news.rss",                        "weight": 0.9, "cat": "finance", "max": 8},
+    {"name": "Investing CN",      "type": "rss",   "url": "https://cn.investing.com/rss/news_285.rss",                     "weight": 0.9, "cat": "finance", "max": 8},
     {"name": "华尔街见闻",         "type": "rss",   "url": "https://dedicated.wallstreetcn.com/rss.xml",                    "weight": 1.1, "cat": "finance", "max": 15},
 
     # ─ AI (一手源权重最高) ──────────────────────────
@@ -73,6 +72,8 @@ SOURCES = [
     {"name": "Google AI Blog",    "type": "rss",   "url": "https://blog.google/technology/ai/rss/",                        "weight": 1.4, "cat": "ai",      "max": 5},
     {"name": "DeepMind",          "type": "rss",   "url": "https://deepmind.google/blog/rss.xml",                          "weight": 1.4, "cat": "ai",      "max": 5},
     {"name": "MIT Tech Review AI","type": "rss",   "url": "https://www.technologyreview.com/topic/artificial-intelligence/feed", "weight": 1.2, "cat": "ai", "max": 5},
+    {"name": "VentureBeat AI",    "type": "rss",   "url": "https://venturebeat.com/category/ai/feed/",                     "weight": 1.1, "cat": "ai",      "max": 7},
+    {"name": "Simon Willison",    "type": "rss",   "url": "https://simonwillison.net/atom/everything/",                    "weight": 1.2, "cat": "ai",      "max": 6},
     {"name": "arXiv cs.AI",       "type": "rss",   "url": "http://export.arxiv.org/rss/cs.AI",                             "weight": 1.1, "cat": "ai",      "max": 6},
     {"name": "arXiv cs.LG",       "type": "rss",   "url": "http://export.arxiv.org/rss/cs.LG",                             "weight": 1.0, "cat": "ai",      "max": 4},
     {"name": "arXiv cs.CL",       "type": "rss",   "url": "http://export.arxiv.org/rss/cs.CL",                             "weight": 1.0, "cat": "ai",      "max": 4},
@@ -84,16 +85,18 @@ SOURCES = [
     {"name": "The Verge",         "type": "rss",   "url": "https://www.theverge.com/rss/index.xml",                        "weight": 1.0, "cat": "tech",    "max": 10},
     {"name": "Ars Technica",      "type": "rss",   "url": "https://feeds.arstechnica.com/arstechnica/index",               "weight": 1.0, "cat": "tech",    "max": 10},
     {"name": "Wired",             "type": "rss",   "url": "https://www.wired.com/feed/rss",                                "weight": 1.0, "cat": "tech",    "max": 10},
-    {"name": "BBC Tech",          "type": "rss",   "url": "https://feeds.bbci.co.uk/news/technology/rss.xml",              "weight": 1.1, "cat": "tech",    "max": 8},
+    {"name": "VentureBeat",       "type": "rss",   "url": "https://venturebeat.com/feed/",                                 "weight": 1.0, "cat": "tech",    "max": 7},
+    {"name": "Stratechery",       "type": "rss",   "url": "https://stratechery.com/feed/",                                 "weight": 1.2, "cat": "tech",    "max": 5},
     {"name": "InfoQ",             "type": "rss",   "url": "https://feed.infoq.com/",                                       "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "Hacker Noon",       "type": "rss",   "url": "https://hackernoon.com/feed",                                   "weight": 0.8, "cat": "tech",    "max": 8},
+    {"name": "TechNode",          "type": "rss",   "url": "https://technode.com/feed/",                                    "weight": 0.9, "cat": "tech",    "max": 8},
     {"name": "36Kr",              "type": "rss",   "url": "https://36kr.com/feed",                                         "weight": 1.0, "cat": "tech",    "max": 10},
     {"name": "爱范儿",             "type": "rss",   "url": "https://www.ifanr.com/feed",                                    "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "钛媒体",             "type": "rss",   "url": "https://www.tmtpost.com/rss.xml",                               "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "雷锋网",             "type": "rss",   "url": "https://www.leiphone.com/feed",                                 "weight": 0.9, "cat": "tech",    "max": 8},
+    {"name": "Solidot",           "type": "rss",   "url": "https://www.solidot.org/index.rss",                             "weight": 0.9, "cat": "tech",    "max": 10},
     {"name": "少数派",             "type": "rss",   "url": "https://sspai.com/feed",                                        "weight": 0.8, "cat": "tech",    "max": 6},
     {"name": "GitHub Trending",   "type": "gh_trending", "url": "https://github.com/trending?since=daily",                 "weight": 0.9, "cat": "tech",    "max": 8},
-
-    # ─ World (综合时政，作为背景板块) ───────────────
-    {"name": "BBC World",         "type": "rss",   "url": "https://feeds.bbci.co.uk/news/world/rss.xml",                   "weight": 1.2, "cat": "world",   "max": 8},
-    {"name": "NYT HomePage",      "type": "rss",   "url": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",     "weight": 1.2, "cat": "world",   "max": 8},
 ]
 
 
@@ -411,7 +414,7 @@ def dedup_and_score(items):
 #  LLM SUMMARIZATION
 # ═══════════════════════════════════════════════════════════════════
 
-def build_digest_input(clusters, per_cat=(("finance", 4), ("ai", 5), ("tech", 4), ("world", 2))):
+def build_digest_input(clusters, per_cat=(("finance", 7), ("ai", 8), ("tech", 7))):
     """Pick top-N per category and format for LLM."""
     selected = []
     parts = []
@@ -466,14 +469,13 @@ def generate_summary(clusters):
         "（同上格式）\n\n"
         "━━━ 🔬 科技动态 ━━━\n\n"
         "（同上格式）\n\n"
-        "━━━ 🌍 世界要闻 ━━━（可选，如无则省略）\n\n"
         f"📊 本期覆盖多源交叉验证 | 共 {len(selected)} 条精选\n\n"
         "严格要求:\n"
-        "- 从素材中挑选 5-9 条最有价值的新闻（优先高 score 和多源交叉的）\n"
-        "- 金融 1-3 条 / AI 2-4 条 / 科技 1-3 条 / 世界 0-2 条\n"
-        "- 每条摘要 2-3 句话（50-120 字），标题不超过 15 字\n"
+        "- 从素材中挑选 9-13 条最有价值的新闻（优先高 score 和多源交叉的）\n"
+        "- 金融 3-4 条 / AI 3-5 条 / 科技 3-4 条\n"
+        "- 每条摘要 2-3 句话（60-120 字），标题不超过 15 字\n"
         "- 📎 来源行必须原样保留素材中给出的来源列表\n"
-        "- 全文控制在 2500 字符以内\n"
+        "- 全文控制在 3500 字符以内\n"
         "- 使用简洁中文，避免翻译腔，保留关键数据\n"
         "- 不要使用 Markdown 语法，不要编造原文之外的信息\n"
         "- 直接输出速递，不要前言或解释\n\n"
